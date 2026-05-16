@@ -10,12 +10,13 @@ set -Eeuo pipefail
 #   bash deploy-emby-nginx-reverse.sh
 #
 # Notes:
-#   This script generates an HTTP nginx server block only. If you need HTTPS,
-#   add certbot/acme after this script or put this config behind an existing CDN/SSL layer.
+#   This script generates an HTTPS nginx server block with a self-signed certificate,
+#   plus an HTTP -> HTTPS redirect server block.
 
 SCRIPT_NAME="$(basename "$0")"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 BACKUP_DIR="/etc/nginx/emby-reverse-backups"
+SSL_DIR="/etc/nginx/ssl/emby-reverse"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -29,31 +30,48 @@ need_root() {
   fi
 }
 
-install_nginx_if_needed() {
-  if command -v nginx >/dev/null 2>&1; then
+install_packages_if_needed() {
+  local need_nginx=0
+  local need_openssl=0
+
+  command -v nginx >/dev/null 2>&1 || need_nginx=1
+  command -v openssl >/dev/null 2>&1 || need_openssl=1
+
+  if [[ "${need_nginx}" -eq 0 ]]; then
     info "检测到 nginx 已安装：$(nginx -v 2>&1)"
+  fi
+  if [[ "${need_openssl}" -eq 0 ]]; then
+    info "检测到 openssl 已安装"
+  fi
+  if [[ "${need_nginx}" -eq 0 && "${need_openssl}" -eq 0 ]]; then
     return
   fi
 
-  yellow "未检测到 nginx，开始安装..."
+  yellow "开始安装缺失组件..."
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y nginx
+    [[ "${need_nginx}" -eq 1 ]] && apt-get install -y nginx
+    [[ "${need_openssl}" -eq 1 ]] && apt-get install -y openssl
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y nginx
+    [[ "${need_nginx}" -eq 1 ]] && dnf install -y nginx
+    [[ "${need_openssl}" -eq 1 ]] && dnf install -y openssl
   elif command -v yum >/dev/null 2>&1; then
     yum install -y epel-release || true
-    yum install -y nginx
+    [[ "${need_nginx}" -eq 1 ]] && yum install -y nginx
+    [[ "${need_openssl}" -eq 1 ]] && yum install -y openssl
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache nginx
+    local packages=()
+    [[ "${need_nginx}" -eq 1 ]] && packages+=(nginx)
+    [[ "${need_openssl}" -eq 1 ]] && packages+=(openssl)
+    apk add --no-cache "${packages[@]}"
   else
-    red "无法识别包管理器，请先手动安装 nginx 后再运行本脚本。"
+    red "无法识别包管理器，请先手动安装 nginx 和 openssl 后再运行本脚本。"
     exit 1
   fi
 }
 
 ensure_nginx_dirs() {
-  mkdir -p "${NGINX_CONF_DIR}" "${BACKUP_DIR}"
+  mkdir -p "${NGINX_CONF_DIR}" "${BACKUP_DIR}" "${SSL_DIR}"
 
   # Some systems do not include conf.d/*.conf by default.
   if [[ -f /etc/nginx/nginx.conf ]] && ! grep -Eq 'include\s+/etc/nginx/conf\.d/\*\.conf;' /etc/nginx/nginx.conf; then
@@ -118,10 +136,32 @@ write_common_proxy_headers() {
 EOF
 }
 
+generate_self_signed_cert() {
+  local server_name="$1"
+  local cert_path="$2"
+  local key_path="$3"
+
+  if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
+    info "检测到已有自签证书：${cert_path}"
+    return
+  fi
+
+  info "生成自签 HTTPS 证书..."
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -keyout "${key_path}" \
+    -out "${cert_path}" \
+    -subj "/CN=${server_name}" \
+    -addext "subjectAltName=DNS:${server_name},IP:127.0.0.1" >/dev/null 2>&1
+  chmod 600 "${key_path}"
+}
+
 generate_same_config() {
   local server_name="$1"
-  local listen_port="$2"
-  local emby_origin="$3"
+  local http_port="$2"
+  local https_port="$3"
+  local cert_path="$4"
+  local key_path="$5"
+  local emby_origin="$6"
 
   cat <<EOF
 map \$http_upgrade \$connection_upgrade {
@@ -130,8 +170,20 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 server {
-    listen ${listen_port};
+    listen ${http_port};
     server_name ${server_name};
+    return 301 https://\$host:${https_port}\$request_uri;
+}
+
+server {
+    listen ${https_port} ssl http2;
+    server_name ${server_name};
+
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
 
     client_max_body_size 0;
 
@@ -145,9 +197,12 @@ EOF
 
 generate_split_config() {
   local server_name="$1"
-  local listen_port="$2"
-  local frontend_origin="$3"
-  local backend_origin="$4"
+  local http_port="$2"
+  local https_port="$3"
+  local cert_path="$4"
+  local key_path="$5"
+  local frontend_origin="$6"
+  local backend_origin="$7"
 
   cat <<EOF
 map \$http_upgrade \$connection_upgrade {
@@ -156,8 +211,20 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 server {
-    listen ${listen_port};
+    listen ${http_port};
     server_name ${server_name};
+    return 301 https://\$host:${https_port}\$request_uri;
+}
+
+server {
+    listen ${https_port} ssl http2;
+    server_name ${server_name};
+
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
 
     client_max_body_size 0;
 
@@ -191,7 +258,7 @@ reload_nginx() {
 
 main() {
   need_root
-  install_nginx_if_needed
+  install_packages_if_needed
   ensure_nginx_dirs
 
   echo ""
@@ -205,19 +272,25 @@ main() {
     read -r -p "请选择结构 [1/2]: " mode
   done
 
-  local server_name listen_port conf_name conf_path tmp_conf
+  local server_name http_port https_port conf_name conf_path tmp_conf safe_name cert_path key_path
   server_name="$(read_required '请输入反代访问域名/IP，例如 emby.example.com 或 _: ')"
-  listen_port="$(read_optional_default '请输入监听端口' '80')"
-  conf_name="emby-${server_name//[^A-Za-z0-9_.-]/_}-${listen_port}.conf"
+  http_port="$(read_optional_default '请输入 HTTP 跳转端口' '80')"
+  https_port="$(read_optional_default '请输入 HTTPS 监听端口' '443')"
+  safe_name="${server_name//[^A-Za-z0-9_.-]/_}"
+  conf_name="emby-${safe_name}-${https_port}.conf"
   conf_path="${NGINX_CONF_DIR}/${conf_name}"
+  cert_path="${SSL_DIR}/${safe_name}.crt"
+  key_path="${SSL_DIR}/${safe_name}.key"
   tmp_conf="$(mktemp)"
+
+  generate_self_signed_cert "${server_name}" "${cert_path}" "${key_path}"
 
   if [[ "${mode}" == "1" ]]; then
     local emby_origin
     emby_origin="$(read_required '请输入 Emby 源站地址，例如 http://127.0.0.1:8096: ')"
     emby_origin="$(trim_trailing_slash "${emby_origin}")"
     validate_origin "Emby 源站地址" "${emby_origin}"
-    generate_same_config "${server_name}" "${listen_port}" "${emby_origin}" > "${tmp_conf}"
+    generate_same_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${emby_origin}" > "${tmp_conf}"
   else
     local frontend_origin backend_origin
     frontend_origin="$(read_required '请输入前端源站地址，例如 http://127.0.0.1:8096: ')"
@@ -226,7 +299,7 @@ main() {
     backend_origin="$(trim_trailing_slash "${backend_origin}")"
     validate_origin "前端源站地址" "${frontend_origin}"
     validate_origin "后端推流域名/地址" "${backend_origin}"
-    generate_split_config "${server_name}" "${listen_port}" "${frontend_origin}" "${backend_origin}" > "${tmp_conf}"
+    generate_split_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${frontend_origin}" "${backend_origin}" > "${tmp_conf}"
   fi
 
   if [[ -f "${conf_path}" ]]; then
@@ -245,11 +318,14 @@ main() {
 
   echo ""
   green "部署完成。"
-  echo "访问地址：http://${server_name}:${listen_port}"
+  echo "访问地址：https://${server_name}:${https_port}"
+  echo "HTTP 跳转：http://${server_name}:${http_port} -> HTTPS"
   echo "配置文件：${conf_path}"
+  echo "证书文件：${cert_path}"
+  echo "私钥文件：${key_path}"
   echo ""
   yellow "提示："
-  echo "- 本脚本只配置 HTTP；需要 HTTPS 的话，后续再用 certbot/acme 签证书。"
+  echo "- 当前使用自签证书，浏览器首次访问会提示不受信任，手动继续访问即可。"
   echo "- 如果你前后端分离的推流路径有特殊规则，可编辑 ${conf_path} 里的后端 location 正则。"
 }
 
