@@ -118,10 +118,72 @@ validate_origin() {
   fi
 }
 
+parse_backend_origins() {
+  local raw="$1"
+  local item=""
+  BACKEND_ORIGINS=()
+
+  IFS=',' read -ra items <<< "${raw}"
+  for item in "${items[@]}"; do
+    item="$(echo "${item}" | xargs)"
+    [[ -z "${item}" ]] && continue
+    item="$(trim_trailing_slash "${item}")"
+    validate_origin "后端推流域名/地址" "${item}"
+    BACKEND_ORIGINS+=("${item}")
+  done
+
+  if [[ "${#BACKEND_ORIGINS[@]}" -eq 0 ]]; then
+    red "至少需要填写一个后端推流域名/地址。"
+    exit 1
+  fi
+}
+
+write_stream_backend_selector() {
+  local origins=("$@")
+  local count="${#origins[@]}"
+  local i percent
+
+  cat <<'EOF'
+map $emby_stream_backend $emby_stream_backend_host {
+    default $proxy_host;
+    ~^https?://([^/:]+) $1;
+}
+
+map $emby_stream_backend $emby_stream_backend_host_header {
+    default $proxy_host;
+    ~^https?://([^/]+) $1;
+}
+
+EOF
+
+  if [[ "${count}" -eq 1 ]]; then
+    cat <<EOF
+map \$request_uri \$emby_stream_backend {
+    default ${origins[0]};
+}
+EOF
+    return
+  fi
+
+  cat <<'EOF'
+split_clients "${remote_addr}${request_uri}${http_user_agent}" $emby_stream_backend {
+EOF
+  for ((i = 0; i < count; i++)); do
+    if [[ "${i}" -eq $((count - 1)) ]]; then
+      printf '    * %s;\n' "${origins[$i]}"
+    else
+      percent=$((100 / count))
+      printf '    %s%% %s;\n' "${percent}" "${origins[$i]}"
+    fi
+  done
+  cat <<'EOF'
+}
+EOF
+}
+
 write_common_proxy_headers() {
   cat <<'EOF'
         proxy_http_version 1.1;
-        proxy_set_header Host $proxy_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -175,6 +237,7 @@ server {
 
     location / {
 $(write_common_proxy_headers)
+        proxy_set_header Host \$proxy_host;
         proxy_pass ${origin};
     }
 }
@@ -229,6 +292,9 @@ server {
     listen ${https_port} ssl http2;
     server_name ${server_name};
 
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
+
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -243,6 +309,7 @@ server {
 
     location / {
 $(write_common_proxy_headers)
+        proxy_set_header Host \$proxy_host;
         proxy_pass ${emby_origin};
     }
 }
@@ -256,13 +323,16 @@ generate_split_config() {
   local cert_path="$4"
   local key_path="$5"
   local frontend_origin="$6"
-  local backend_origin="$7"
+  shift 6
+  local backend_origins=("$@")
 
   cat <<EOF
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     '' close;
 }
+
+$(write_stream_backend_selector "${backend_origins[@]}")
 
 server {
     listen ${http_port};
@@ -273,6 +343,9 @@ server {
 server {
     listen ${https_port} ssl http2;
     server_name ${server_name};
+
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout 5s;
 
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};
@@ -286,15 +359,18 @@ server {
 
     client_max_body_size 0;
 
-    # 后端推流/长连接相关路径：走后端推流域名
+    # 后端推流/长连接相关路径：走后端推流域名；多个后端会按客户端和请求稳定分流
     location ~* ^/(embywebsocket|socket|Videos|Audio|LiveTv|LiveStreams|Sync|emby/Videos|emby/Audio|emby/LiveTv|emby/LiveStreams|emby/Sync|Items/.*/Download|emby/Items/.*/Download) {
 $(write_common_proxy_headers)
-        proxy_pass ${backend_origin};
+        proxy_set_header Host \$emby_stream_backend_host_header;
+        proxy_ssl_name \$emby_stream_backend_host;
+        proxy_pass \$emby_stream_backend;
     }
 
     # 其它 Web 页面、静态资源和普通 API：走前端域名
     location / {
 $(write_common_proxy_headers)
+        proxy_set_header Host \$proxy_host;
         proxy_pass ${frontend_origin};
     }
 }
@@ -385,6 +461,7 @@ add_or_update_reverse_proxy() {
   done
 
   local server_name http_port https_port email conf_name conf_path tmp_conf safe_name cert_path key_path primary_origin
+  local -a BACKEND_ORIGINS=()
   server_name="$(read_required '请输入反代访问域名，例如 emby.example.com: ')"
   validate_domain_for_letsencrypt "${server_name}"
   email="$(read_required '请输入申请 Let’s Encrypt 证书用的邮箱: ')"
@@ -404,13 +481,12 @@ add_or_update_reverse_proxy() {
     validate_origin "Emby 源站地址" "${emby_origin}"
     primary_origin="${emby_origin}"
   else
-    local frontend_origin backend_origin
+    local frontend_origin backend_origin_raw
     frontend_origin="$(read_required '请输入前端源站地址，例如 http://127.0.0.1:8096: ')"
-    backend_origin="$(read_required '请输入后端推流域名/地址，例如 https://stream.example.com 或 http://10.0.0.2:8096: ')"
+    backend_origin_raw="$(read_required '请输入后端推流域名/地址，多个用英文逗号分隔，例如 https://stream1.example.com,https://stream2.example.com: ')"
     frontend_origin="$(trim_trailing_slash "${frontend_origin}")"
-    backend_origin="$(trim_trailing_slash "${backend_origin}")"
     validate_origin "前端源站地址" "${frontend_origin}"
-    validate_origin "后端推流域名/地址" "${backend_origin}"
+    parse_backend_origins "${backend_origin_raw}"
     primary_origin="${frontend_origin}"
   fi
 
@@ -432,7 +508,7 @@ add_or_update_reverse_proxy() {
   if [[ "${mode}" == "1" ]]; then
     generate_same_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${primary_origin}" > "${tmp_conf}"
   else
-    generate_split_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${frontend_origin}" "${backend_origin}" > "${tmp_conf}"
+    generate_split_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${frontend_origin}" "${BACKEND_ORIGINS[@]}" > "${tmp_conf}"
   fi
 
   cp "${tmp_conf}" "${conf_path}"

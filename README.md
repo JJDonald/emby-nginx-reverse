@@ -3,7 +3,7 @@
 交互式管理 Emby 的 Nginx 反代配置，支持添加/更新和删除反代。添加反代时支持两种结构：
 
 1. **前后端一致**：所有请求直接反代到同一个 Emby 地址。
-2. **前后端分离**：Web/API 走前端地址，播放/推流/长连接路径走后端推流域名。
+2. **前后端分离**：Web/API 走前端地址，播放/推流/长连接路径走后端推流域名；后端推流域名支持填写多个，用英文逗号分隔。
 
 脚本会先生成临时 HTTP 配置用于 Let’s Encrypt HTTP-01 验证，申请成功后自动切换到 HTTPS，并创建 HTTP -> HTTPS 跳转。
 
@@ -45,6 +45,7 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 自动创建 HTTP 跳转 HTTPS
 - HTTPS 上游自动开启 SNI，兼容反代到 HTTPS 后端域名/CDN
 - 交互选择前后端一致 / 前后端分离
+- 前后端分离模式支持多个后端推流域名，按客户端和请求稳定分流
 - 自动生成 `/etc/nginx/conf.d/` 配置
 - 覆盖旧配置前自动备份
 - 执行 `nginx -t` 检查配置
@@ -62,4 +63,5 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 证书默认保存在 `/etc/letsencrypt/live/<你的域名>/`。
 - certbot 通常会自动安装续期定时任务，可用 `certbot renew --dry-run` 测试续期。
 - 前后端分离模式内置了常见 Emby 推流、下载、WebSocket 路径；如有特殊路径，可手动编辑生成的 nginx 配置。
+- 多个后端推流域名填写示例：`https://stream1.example.com,https://stream2.example.com:8920`。
 - 当源站地址是 HTTPS 域名时，脚本会在反代配置中加入 `proxy_ssl_server_name on;`、`proxy_ssl_name $proxy_host;`，并把 `Host` 传给上游域名，避免上游 SNI/Host/证书不匹配。
