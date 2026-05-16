@@ -13,7 +13,6 @@
 curl -fsSL https://raw.githubusercontent.com/JJDonald/emby-nginx-reverse/main/deploy-emby-nginx-reverse.sh -o /tmp/deploy-emby-nginx-reverse.sh && sudo bash /tmp/deploy-emby-nginx-reverse.sh
 ```
 
-> 如果仓库是 Private，服务器直接 curl 这个 raw 地址会拿不到脚本；需要把仓库改 Public，或先登录/配置 GitHub 访问权限。
 
 ## 使用
 
