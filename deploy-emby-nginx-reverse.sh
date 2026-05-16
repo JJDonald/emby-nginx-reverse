@@ -129,6 +129,8 @@ write_common_proxy_headers() {
         proxy_set_header X-Forwarded-Port $server_port;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
+        proxy_ssl_server_name on;
+        proxy_ssl_name $proxy_host;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 3600s;

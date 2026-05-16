@@ -35,6 +35,7 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 自动检测并安装 nginx / certbot
 - 自动申请 Let’s Encrypt 证书
 - 自动创建 HTTP 跳转 HTTPS
+- HTTPS 上游自动开启 SNI，兼容反代到 HTTPS 后端域名/CDN
 - 交互选择前后端一致 / 前后端分离
 - 自动生成 `/etc/nginx/conf.d/` 配置
 - 覆盖旧配置前自动备份
@@ -53,3 +54,4 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 证书默认保存在 `/etc/letsencrypt/live/<你的域名>/`。
 - certbot 通常会自动安装续期定时任务，可用 `certbot renew --dry-run` 测试续期。
 - 前后端分离模式内置了常见 Emby 推流、下载、WebSocket 路径；如有特殊路径，可手动编辑生成的 nginx 配置。
+- 当源站地址是 HTTPS 域名时，脚本会在反代配置中加入 `proxy_ssl_server_name on;` 和 `proxy_ssl_name $proxy_host;`，避免上游 SNI/证书不匹配。
