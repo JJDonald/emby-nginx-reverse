@@ -10,13 +10,13 @@ set -Eeuo pipefail
 #   bash deploy-emby-nginx-reverse.sh
 #
 # Notes:
-#   This script generates an HTTPS nginx server block with a self-signed certificate,
-#   plus an HTTP -> HTTPS redirect server block.
+#   This script generates an HTTP nginx server block first, obtains a Let's Encrypt
+#   certificate with certbot webroot mode, then rewrites nginx to HTTPS with HTTP -> HTTPS redirect.
 
 SCRIPT_NAME="$(basename "$0")"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 BACKUP_DIR="/etc/nginx/emby-reverse-backups"
-SSL_DIR="/etc/nginx/ssl/emby-reverse"
+ACME_WEBROOT="/var/www/letsencrypt"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -32,18 +32,18 @@ need_root() {
 
 install_packages_if_needed() {
   local need_nginx=0
-  local need_openssl=0
+  local need_certbot=0
 
   command -v nginx >/dev/null 2>&1 || need_nginx=1
-  command -v openssl >/dev/null 2>&1 || need_openssl=1
+  command -v certbot >/dev/null 2>&1 || need_certbot=1
 
   if [[ "${need_nginx}" -eq 0 ]]; then
     info "检测到 nginx 已安装：$(nginx -v 2>&1)"
   fi
-  if [[ "${need_openssl}" -eq 0 ]]; then
-    info "检测到 openssl 已安装"
+  if [[ "${need_certbot}" -eq 0 ]]; then
+    info "检测到 certbot 已安装"
   fi
-  if [[ "${need_nginx}" -eq 0 && "${need_openssl}" -eq 0 ]]; then
+  if [[ "${need_nginx}" -eq 0 && "${need_certbot}" -eq 0 ]]; then
     return
   fi
 
@@ -51,27 +51,27 @@ install_packages_if_needed() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     [[ "${need_nginx}" -eq 1 ]] && apt-get install -y nginx
-    [[ "${need_openssl}" -eq 1 ]] && apt-get install -y openssl
+    [[ "${need_certbot}" -eq 1 ]] && apt-get install -y certbot
   elif command -v dnf >/dev/null 2>&1; then
     [[ "${need_nginx}" -eq 1 ]] && dnf install -y nginx
-    [[ "${need_openssl}" -eq 1 ]] && dnf install -y openssl
+    [[ "${need_certbot}" -eq 1 ]] && dnf install -y certbot
   elif command -v yum >/dev/null 2>&1; then
     yum install -y epel-release || true
     [[ "${need_nginx}" -eq 1 ]] && yum install -y nginx
-    [[ "${need_openssl}" -eq 1 ]] && yum install -y openssl
+    [[ "${need_certbot}" -eq 1 ]] && yum install -y certbot
   elif command -v apk >/dev/null 2>&1; then
     local packages=()
     [[ "${need_nginx}" -eq 1 ]] && packages+=(nginx)
-    [[ "${need_openssl}" -eq 1 ]] && packages+=(openssl)
+    [[ "${need_certbot}" -eq 1 ]] && packages+=(certbot)
     apk add --no-cache "${packages[@]}"
   else
-    red "无法识别包管理器，请先手动安装 nginx 和 openssl 后再运行本脚本。"
+    red "无法识别包管理器，请先手动安装 nginx 和 certbot 后再运行本脚本。"
     exit 1
   fi
 }
 
 ensure_nginx_dirs() {
-  mkdir -p "${NGINX_CONF_DIR}" "${BACKUP_DIR}" "${SSL_DIR}"
+  mkdir -p "${NGINX_CONF_DIR}" "${BACKUP_DIR}" "${ACME_WEBROOT}"
 
   # Some systems do not include conf.d/*.conf by default.
   if [[ -f /etc/nginx/nginx.conf ]] && ! grep -Eq 'include\s+/etc/nginx/conf\.d/\*\.conf;' /etc/nginx/nginx.conf; then
@@ -136,23 +136,71 @@ write_common_proxy_headers() {
 EOF
 }
 
-generate_self_signed_cert() {
-  local server_name="$1"
-  local cert_path="$2"
-  local key_path="$3"
+validate_domain_for_letsencrypt() {
+  local domain="$1"
+  if [[ "${domain}" == "_" || "${domain}" =~ ^[0-9.]+$ || "${domain}" =~ : ]]; then
+    red "Let's Encrypt 只能给公网域名签证书，不能使用 IP、_ 或带端口的 server_name：${domain}"
+    exit 1
+  fi
+}
 
-  if [[ -f "${cert_path}" && -f "${key_path}" ]]; then
-    info "检测到已有自签证书：${cert_path}"
+cert_path_for_domain() {
+  printf '/etc/letsencrypt/live/%s/fullchain.pem' "$1"
+}
+
+key_path_for_domain() {
+  printf '/etc/letsencrypt/live/%s/privkey.pem' "$1"
+}
+
+generate_http_config() {
+  local server_name="$1"
+  local http_port="$2"
+  local origin="$3"
+
+  cat <<EOF
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen ${http_port};
+    server_name ${server_name};
+
+    location /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+    }
+
+    location / {
+$(write_common_proxy_headers)
+        proxy_pass ${origin};
+    }
+}
+EOF
+}
+
+obtain_letsencrypt_cert() {
+  local domain="$1"
+  local email="$2"
+  local http_port="$3"
+
+  if [[ -f "$(cert_path_for_domain "${domain}")" && -f "$(key_path_for_domain "${domain}")" ]]; then
+    info "检测到已有 Let's Encrypt 证书：/etc/letsencrypt/live/${domain}/"
     return
   fi
 
-  info "生成自签 HTTPS 证书..."
-  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-    -keyout "${key_path}" \
-    -out "${cert_path}" \
-    -subj "/CN=${server_name}" \
-    -addext "subjectAltName=DNS:${server_name},IP:127.0.0.1" >/dev/null 2>&1
-  chmod 600 "${key_path}"
+  if [[ "${http_port}" != "80" ]]; then
+    yellow "注意：HTTP-01 验证要求公网 80 端口可访问。当前 HTTP 端口为 ${http_port}，申请证书可能失败。"
+  fi
+
+  info "开始申请 Let's Encrypt 证书..."
+  certbot certonly --webroot \
+    -w "${ACME_WEBROOT}" \
+    -d "${domain}" \
+    --email "${email}" \
+    --agree-tos \
+    --no-eff-email \
+    --non-interactive
 }
 
 generate_same_config() {
@@ -184,6 +232,10 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
+
+    location /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+    }
 
     client_max_body_size 0;
 
@@ -225,6 +277,10 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
+
+    location /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+    }
 
     client_max_body_size 0;
 
@@ -272,25 +328,25 @@ main() {
     read -r -p "请选择结构 [1/2]: " mode
   done
 
-  local server_name http_port https_port conf_name conf_path tmp_conf safe_name cert_path key_path
-  server_name="$(read_required '请输入反代访问域名/IP，例如 emby.example.com 或 _: ')"
-  http_port="$(read_optional_default '请输入 HTTP 跳转端口' '80')"
+  local server_name http_port https_port email conf_name conf_path tmp_conf safe_name cert_path key_path primary_origin
+  server_name="$(read_required '请输入反代访问域名，例如 emby.example.com: ')"
+  validate_domain_for_letsencrypt "${server_name}"
+  email="$(read_required '请输入申请 Let’s Encrypt 证书用的邮箱: ')"
+  http_port="$(read_optional_default '请输入 HTTP 端口，Let’s Encrypt 推荐/要求公网 80' '80')"
   https_port="$(read_optional_default '请输入 HTTPS 监听端口' '443')"
   safe_name="${server_name//[^A-Za-z0-9_.-]/_}"
   conf_name="emby-${safe_name}-${https_port}.conf"
   conf_path="${NGINX_CONF_DIR}/${conf_name}"
-  cert_path="${SSL_DIR}/${safe_name}.crt"
-  key_path="${SSL_DIR}/${safe_name}.key"
+  cert_path="$(cert_path_for_domain "${server_name}")"
+  key_path="$(key_path_for_domain "${server_name}")"
   tmp_conf="$(mktemp)"
-
-  generate_self_signed_cert "${server_name}" "${cert_path}" "${key_path}"
 
   if [[ "${mode}" == "1" ]]; then
     local emby_origin
     emby_origin="$(read_required '请输入 Emby 源站地址，例如 http://127.0.0.1:8096: ')"
     emby_origin="$(trim_trailing_slash "${emby_origin}")"
     validate_origin "Emby 源站地址" "${emby_origin}"
-    generate_same_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${emby_origin}" > "${tmp_conf}"
+    primary_origin="${emby_origin}"
   else
     local frontend_origin backend_origin
     frontend_origin="$(read_required '请输入前端源站地址，例如 http://127.0.0.1:8096: ')"
@@ -299,7 +355,7 @@ main() {
     backend_origin="$(trim_trailing_slash "${backend_origin}")"
     validate_origin "前端源站地址" "${frontend_origin}"
     validate_origin "后端推流域名/地址" "${backend_origin}"
-    generate_split_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${frontend_origin}" "${backend_origin}" > "${tmp_conf}"
+    primary_origin="${frontend_origin}"
   fi
 
   if [[ -f "${conf_path}" ]]; then
@@ -308,11 +364,26 @@ main() {
     yellow "已备份旧配置：${backup_path}"
   fi
 
+  generate_http_config "${server_name}" "${http_port}" "${primary_origin}" > "${tmp_conf}"
+  cp "${tmp_conf}" "${conf_path}"
+  echo ""
+  info "已写入临时 HTTP 配置：${conf_path}"
+  info "开始测试并重载 nginx，用于 Let’s Encrypt HTTP-01 验证..."
+  reload_nginx
+
+  obtain_letsencrypt_cert "${server_name}" "${email}" "${http_port}"
+
+  if [[ "${mode}" == "1" ]]; then
+    generate_same_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${primary_origin}" > "${tmp_conf}"
+  else
+    generate_split_config "${server_name}" "${http_port}" "${https_port}" "${cert_path}" "${key_path}" "${frontend_origin}" "${backend_origin}" > "${tmp_conf}"
+  fi
+
   cp "${tmp_conf}" "${conf_path}"
   rm -f "${tmp_conf}"
 
   echo ""
-  info "已写入配置：${conf_path}"
+  info "已写入 HTTPS 配置：${conf_path}"
   info "开始测试并重载 nginx..."
   reload_nginx
 
@@ -325,7 +396,8 @@ main() {
   echo "私钥文件：${key_path}"
   echo ""
   yellow "提示："
-  echo "- 当前使用自签证书，浏览器首次访问会提示不受信任，手动继续访问即可。"
+  echo "- Let’s Encrypt HTTP-01 验证需要域名 A/AAAA 记录指向本机，且公网 80 端口可访问。"
+  echo "- certbot 通常会自动安装续期定时任务；可用 certbot renew --dry-run 测试续期。"
   echo "- 如果你前后端分离的推流路径有特殊规则，可编辑 ${conf_path} 里的后端 location 正则。"
 }
 
