@@ -62,4 +62,4 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 证书默认保存在 `/etc/letsencrypt/live/<你的域名>/`。
 - certbot 通常会自动安装续期定时任务，可用 `certbot renew --dry-run` 测试续期。
 - 前后端分离模式内置了常见 Emby 推流、下载、WebSocket 路径；如有特殊路径，可手动编辑生成的 nginx 配置。
-- 当源站地址是 HTTPS 域名时，脚本会在反代配置中加入 `proxy_ssl_server_name on;` 和 `proxy_ssl_name $proxy_host;`，避免上游 SNI/证书不匹配。
+- 当源站地址是 HTTPS 域名时，脚本会在反代配置中加入 `proxy_ssl_server_name on;`、`proxy_ssl_name $proxy_host;`，并把 `Host` 传给上游域名，避免上游 SNI/Host/证书不匹配。
