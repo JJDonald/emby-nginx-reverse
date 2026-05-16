@@ -7,6 +7,14 @@
 
 脚本会先生成临时 HTTP 配置用于 Let’s Encrypt HTTP-01 验证，申请成功后自动切换到 HTTPS，并创建 HTTP -> HTTPS 跳转。
 
+## 一键命令
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JJDonald/emby-nginx-reverse/main/deploy-emby-nginx-reverse.sh -o /tmp/deploy-emby-nginx-reverse.sh && sudo bash /tmp/deploy-emby-nginx-reverse.sh
+```
+
+> 如果仓库是 Private，服务器直接 curl 这个 raw 地址会拿不到脚本；需要把仓库改 Public，或先登录/配置 GitHub 访问权限。
+
 ## 使用
 
 ```bash
