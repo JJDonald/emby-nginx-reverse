@@ -1,6 +1,6 @@
 # Emby Nginx Reverse Proxy 一键部署脚本
 
-交互式部署 Emby 的 Nginx 反代配置，支持两种结构：
+交互式管理 Emby 的 Nginx 反代配置，支持添加/更新和删除反代。添加反代时支持两种结构：
 
 1. **前后端一致**：所有请求直接反代到同一个 Emby 地址。
 2. **前后端分离**：Web/API 走前端地址，播放/推流/长连接路径走后端推流域名。
@@ -29,6 +29,9 @@ sudo ./deploy-emby-nginx-reverse.sh
 
 ## 功能
 
+- 反代管理菜单：添加/更新、删除
+- 删除反代前自动备份 nginx 配置
+- 删除反代时默认保留 Let’s Encrypt 证书，避免误删
 - 自动检测并安装 nginx / certbot
 - 自动申请 Let’s Encrypt 证书
 - 自动创建 HTTP 跳转 HTTPS
@@ -37,6 +40,12 @@ sudo ./deploy-emby-nginx-reverse.sh
 - 覆盖旧配置前自动备份
 - 执行 `nginx -t` 检查配置
 - 自动 reload/restart nginx
+
+## 删除反代
+
+再次运行脚本，选择 `删除反代`，脚本会列出 `/etc/nginx/conf.d/emby-*.conf` 中由本脚本创建的配置。确认后会备份并删除对应 nginx 配置，然后重载 nginx。
+
+> 删除操作不会删除 Let’s Encrypt 证书。
 
 ## 注意
 

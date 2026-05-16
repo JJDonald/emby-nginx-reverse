@@ -312,13 +312,67 @@ reload_nginx() {
   fi
 }
 
-main() {
-  need_root
-  install_packages_if_needed
-  ensure_nginx_dirs
+list_reverse_configs() {
+  local files=("$@")
+  local index=1
 
   echo ""
-  green "=== Emby Nginx 反代一键部署 ==="
+  green "=== 已有 Emby 反代配置 ==="
+  for file in "${files[@]}"; do
+    printf '%s) %s\n' "${index}" "${file}"
+    index=$((index + 1))
+  done
+}
+
+delete_reverse_proxy() {
+  shopt -s nullglob
+  local files=("${NGINX_CONF_DIR}"/emby-*.conf)
+  shopt -u nullglob
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    yellow "没有找到由本脚本创建的 Emby 反代配置：${NGINX_CONF_DIR}/emby-*.conf"
+    return
+  fi
+
+  list_reverse_configs "${files[@]}"
+
+  local choice=""
+  while true; do
+    read -r -p "请选择要删除的配置编号，或输入 q 取消: " choice
+    if [[ "${choice}" == "q" || "${choice}" == "Q" ]]; then
+      yellow "已取消删除。"
+      return
+    fi
+    if [[ "${choice}" =~ ^[0-9]+$ && "${choice}" -ge 1 && "${choice}" -le "${#files[@]}" ]]; then
+      break
+    fi
+    red "输入无效，请重新选择。"
+  done
+
+  local target="${files[$((choice - 1))]}"
+  local confirm=""
+  echo ""
+  yellow "即将删除反代配置：${target}"
+  yellow "证书不会删除，只删除 nginx 反代配置。"
+  read -r -p "确认删除？输入 y 继续: " confirm
+  if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
+    yellow "已取消删除。"
+    return
+  fi
+
+  local backup_path="${BACKUP_DIR}/$(basename "${target}").$(date +%Y%m%d-%H%M%S).deleted.bak"
+  cp -a "${target}" "${backup_path}"
+  rm -f "${target}"
+
+  info "已备份被删除配置：${backup_path}"
+  info "开始测试并重载 nginx..."
+  reload_nginx
+  green "删除完成。"
+}
+
+add_or_update_reverse_proxy() {
+  echo ""
+  green "=== 添加/更新 Emby Nginx 反代 ==="
   echo "1) 前后端一致：所有请求直接反代到同一个 Emby 地址"
   echo "2) 前后端分离：Web/API 走前端地址，播放/推流走后端推流域名"
   echo ""
@@ -399,6 +453,28 @@ main() {
   echo "- Let’s Encrypt HTTP-01 验证需要域名 A/AAAA 记录指向本机，且公网 80 端口可访问。"
   echo "- certbot 通常会自动安装续期定时任务；可用 certbot renew --dry-run 测试续期。"
   echo "- 如果你前后端分离的推流路径有特殊规则，可编辑 ${conf_path} 里的后端 location 正则。"
+}
+
+main() {
+  need_root
+  install_packages_if_needed
+  ensure_nginx_dirs
+
+  echo ""
+  green "=== Emby Nginx 反代管理 ==="
+  echo "1) 添加/更新反代"
+  echo "2) 删除反代"
+  echo ""
+
+  local action=""
+  while [[ "${action}" != "1" && "${action}" != "2" ]]; do
+    read -r -p "请选择操作 [1/2]: " action
+  done
+
+  case "${action}" in
+    1) add_or_update_reverse_proxy ;;
+    2) delete_reverse_proxy ;;
+  esac
 }
 
 main "$@"
